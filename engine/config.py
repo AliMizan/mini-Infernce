@@ -32,6 +32,26 @@ class EngineConfig:
         if self.num_qo_heads % self.num_kv_heads != 0:
             raise ValueError("num_qo_heads must be divisible by num_kv_heads (GQA)")
 
+    @classmethod
+    def from_hf(cls, hf_config, *, device: str = "cuda", kv_dtype: str = "int8",
+                compute_dtype: str = "float16", max_seq_len: int = 4096,
+                page_size: int = 16) -> "EngineConfig":
+        heads = int(hf_config.num_attention_heads)
+        hidden = int(hf_config.hidden_size)
+        head_dim = int(getattr(hf_config, "head_dim", hidden // heads))
+        return cls(
+            num_layers=int(hf_config.num_hidden_layers),
+            num_qo_heads=heads,
+            num_kv_heads=int(hf_config.num_key_value_heads),
+            head_dim=head_dim,
+            page_size=page_size,
+            max_batch_size=1,
+            max_seq_len=max_seq_len,
+            kv_dtype=kv_dtype,
+            compute_dtype=compute_dtype,
+            device=device,
+        )
+
     @property
     def n_rep(self) -> int:
         return self.num_qo_heads // self.num_kv_heads
