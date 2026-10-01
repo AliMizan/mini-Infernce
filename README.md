@@ -61,3 +61,5 @@ The 1.5B INT8 page pool is a few hundred MiB — weights, not KV, dominate VRAM.
 - Fused paged-attention kernel (walk block table inside the softmax)
 - 4-bit weight packing
 - Multi-sequence continuous batching
+vbdbvsdbbfjhbvjbjsbfjv
+bfbsb
