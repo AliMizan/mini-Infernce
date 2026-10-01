@@ -1,9 +1,11 @@
-"""Greedy generate with the paged cache, optional HuggingFace check.
+"""Generate with the paged cache. Greedy by default, optional sampling and streaming.
 
 Examples
 --------
 python -m engine.generate --prompt "def add(a, b):" --max-new 32
 python -m engine.generate --prompt "def add(a, b):" --max-new 16 --check --kv-dtype float16
+python -m engine.generate --prompt "Write a fizzbuzz in Python" --max-new 200 --temperature 0.7 --top-p 0.9
+python -m engine.generate --prompt "Write a fizzbuzz in Python" --temperature 0.7 --seed 1 --no-stream
 """
 
 from __future__ import annotations
@@ -56,8 +58,37 @@ def load_hf(model_id: str, device: str, compute_dtype: str, load_4bit: bool):
     return model, tok
 
 
+class Streamer:
+    """Prints new text as tokens arrive.
+
+    Decoding one token at a time breaks multi-byte characters and spacing, so we
+    decode all generated ids each time and print only the new part. If the text
+    ends in a broken character, we wait for the next token.
+    """
+
+    def __init__(self, tok):
+        self.tok = tok
+        self.ids = []
+        self.printed = ""
+
+    def _flush(self, hold_broken: bool) -> None:
+        text = self.tok.decode(self.ids, skip_special_tokens=True)
+        if hold_broken and text.endswith("\ufffd"):
+            return
+        print(text[len(self.printed):], end="", flush=True)
+        self.printed = text
+
+    def __call__(self, token_id: int) -> None:
+        self.ids.append(token_id)
+        self._flush(hold_broken=True)
+
+    def finish(self) -> None:
+        self._flush(hold_broken=False)
+        print()
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Paged-cache greedy generate")
+    parser = argparse.ArgumentParser(description="Paged-cache generate")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--prompt", default="def add(a, b):")
     parser.add_argument("--max-new", type=int, default=32)
@@ -67,10 +98,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compute-dtype", default="float16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--device", default=None)
     parser.add_argument("--load-4bit", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.0, help="0 = greedy")
+    parser.add_argument("--top-k", type=int, default=0, help="0 = off")
+    parser.add_argument("--top-p", type=float, default=1.0, help="1.0 = off")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0, help="1.0 = off")
+    parser.add_argument("--seed", type=int, default=None, help="make sampling repeatable")
+    parser.add_argument("--no-stream", action="store_true", help="print the whole answer at the end")
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Compare token ids with HuggingFace generate (use --kv-dtype float16)",
+        help="Compare token ids with HuggingFace generate (use --kv-dtype float16, greedy)",
     )
     args = parser.parse_args(argv)
 
@@ -81,7 +118,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device} model={args.model} kv={args.kv_dtype}")
+    print(
+        f"device={device} model={args.model} kv={args.kv_dtype} "
+        f"temperature={args.temperature} top_k={args.top_k} top_p={args.top_p} "
+        f"rep_penalty={args.repetition_penalty}"
+    )
 
     from engine.config import EngineConfig
     from engine.kv_cache import PagedKVCache
@@ -107,12 +148,31 @@ def main(argv: list[str] | None = None) -> int:
     inputs = tok(text, return_tensors="pt")
     input_ids = inputs["input_ids"].to(cache.device)
 
+    stream = not args.no_stream
+    streamer = Streamer(tok) if stream else None
+    if stream:
+        print("--- output ---")
+
     t0 = time.perf_counter()
-    out = engine.generate(input_ids, max_new_tokens=args.max_new, eos_token_id=tok.eos_token_id)
+    out = engine.generate(
+        input_ids,
+        max_new_tokens=args.max_new,
+        eos_token_id=tok.eos_token_id,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        seed=args.seed,
+        on_token=streamer,
+    )
     dt = time.perf_counter() - t0
-    new_tokens = max(out.shape[1] - input_ids.shape[1], 1)
-    print(f"paged {out.shape[1] - input_ids.shape[1]} new tokens in {dt:.2f}s ({new_tokens / dt:.1f} tok/s)")
-    print(tok.decode(out[0], skip_special_tokens=True))
+    if stream:
+        streamer.finish()
+        print("--------------")
+    n_new = out.shape[1] - input_ids.shape[1]
+    print(f"paged {n_new} new tokens in {dt:.2f}s ({max(n_new, 1) / dt:.1f} tok/s)")
+    if not stream:
+        print(tok.decode(out[0], skip_special_tokens=True))
     print("cache", cache.memory_bytes())
 
     if args.check:
@@ -120,6 +180,12 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "warning: INT8 KV will not match HuggingFace exactly; "
                 "rerun with --kv-dtype float16 for a strict check",
+                file=sys.stderr,
+            )
+        if args.temperature > 0:
+            print(
+                "warning: sampling is random, so token ids will not match "
+                "HuggingFace's greedy output; use --temperature 0 for the check",
                 file=sys.stderr,
             )
         t1 = time.perf_counter()
